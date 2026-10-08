@@ -20,10 +20,21 @@ from approve_exact.store import CorruptEffectError, Store
 
 @dataclass(frozen=True)
 class Outcome:
+    """Result of an executor action."""
+
     ok: bool
     reason: str
     effect_id: str | None = None
     status: str | None = None
+
+
+def _outcome(
+    ok: bool,
+    reason: str,
+    effect_id: str | None = None,
+    status: str | None = None,
+) -> Outcome:
+    return Outcome(ok=ok, reason=reason, effect_id=effect_id, status=status)
 
 
 def _default_clock() -> datetime:
@@ -31,6 +42,8 @@ def _default_clock() -> datetime:
 
 
 class Executor:
+    """Runs propose / approve / execute against a store and adapter."""
+
     def __init__(
         self,
         store: Store,
@@ -46,19 +59,15 @@ class Executor:
         self._clock = clock
 
     def propose(self, effect: Effect) -> Outcome:
+        """Persist a new effect in proposed status."""
         effect_id = self._store.propose(effect)
         row = self._store.get_effect(effect_id)
         if row is None:
-            return Outcome(
-                ok=False,
-                reason="proposed effect missing after insert",
-                effect_id=effect_id,
-            )
-        return Outcome(
-            ok=True, reason="proposed", effect_id=effect_id, status=row.status
-        )
+            return _outcome(False, "proposed effect missing after insert", effect_id)
+        return _outcome(True, "proposed", effect_id, row.status)
 
     def approve(self, effect_id: str, approval: Approval) -> Outcome:
+        """Accept a signed approval for the exact stored effect hash."""
         try:
             row = self._store.get_effect(effect_id)
         except CorruptEffectError as exc:
@@ -68,27 +77,19 @@ class Executor:
                 exc.status,
                 f"approve refused: corrupt effect: {exc.reason}",
             )
-            return Outcome(
-                ok=False,
-                reason=f"corrupt effect: {exc.reason}",
-                effect_id=effect_id,
-                status=exc.status,
+            return _outcome(
+                False, f"corrupt effect: {exc.reason}", effect_id, exc.status
             )
         if row is None:
             self._store.log_event(
                 effect_id, "missing", "missing", "approve refused: effect not found"
             )
-            return Outcome(ok=False, reason="effect not found", effect_id=effect_id)
+            return _outcome(False, "effect not found", effect_id)
         if row.status != "proposed":
             self._store.log_event(
                 effect_id, row.status, row.status, "approve refused: not proposed"
             )
-            return Outcome(
-                ok=False,
-                reason="not in proposed status",
-                effect_id=effect_id,
-                status=row.status,
-            )
+            return _outcome(False, "not in proposed status", effect_id, row.status)
         recomputed = effect_hash(row.effect)
         if recomputed != row.effect_hash:
             return self._refuse_approve(
@@ -106,14 +107,11 @@ class Executor:
         if approval.is_expired(now):
             return self._refuse_approve(effect_id, "approval already expired")
         if not self._store.approve(effect_id, approval):
-            return Outcome(
-                ok=False, reason="could not claim proposed row", effect_id=effect_id
-            )
-        return Outcome(
-            ok=True, reason="approved", effect_id=effect_id, status="approved"
-        )
+            return _outcome(False, "could not claim proposed row", effect_id)
+        return _outcome(True, "approved", effect_id, "approved")
 
     def execute(self, effect_id: str) -> Outcome:
+        """Claim an approved row once and call the provider with its key."""
         try:
             row = self._store.get_effect(effect_id)
         except CorruptEffectError as exc:
@@ -122,7 +120,7 @@ class Executor:
             self._store.log_event(
                 effect_id, "missing", "missing", "execute refused: effect not found"
             )
-            return Outcome(ok=False, reason="effect not found", effect_id=effect_id)
+            return _outcome(False, "effect not found", effect_id)
         stored = self._store.get_approval(effect_id)
         if stored is None:
             return self._log_execute_refuse(
@@ -165,24 +163,14 @@ class Executor:
             self._store.transition(
                 effect_id, "executing", "unknown", "provider timeout"
             )
-            return Outcome(
-                ok=False,
-                reason="provider timeout",
-                effect_id=effect_id,
-                status="unknown",
-            )
+            return _outcome(False, "provider timeout", effect_id, "unknown")
         except AlreadyExists:
             return self._reconcile_existing(effect_id, effect, recomputed)
         except ProviderError as exc:
             self._store.transition(
                 effect_id, "executing", "refused", f"provider error: {exc}"
             )
-            return Outcome(
-                ok=False,
-                reason=f"provider error: {exc}",
-                effect_id=effect_id,
-                status="refused",
-            )
+            return _outcome(False, f"provider error: {exc}", effect_id, "refused")
         except Exception as exc:
             self._store.transition(
                 effect_id, "executing", "unknown", f"unexpected error: {exc}"
@@ -201,15 +189,8 @@ class Executor:
             "provider create ok",
             provider_id=record.provider_id,
         ):
-            return Outcome(
-                ok=False,
-                reason="could not mark executed",
-                effect_id=effect_id,
-                status="executing",
-            )
-        return Outcome(
-            ok=True, reason="executed", effect_id=effect_id, status="executed"
-        )
+            return _outcome(False, "could not mark executed", effect_id, "executing")
+        return _outcome(True, "executed", effect_id, "executed")
 
     def _reconcile_existing(
         self, effect_id: str, effect: Effect, recomputed: str
@@ -225,11 +206,8 @@ class Executor:
             self._store.transition(
                 effect_id, "executing", "unknown", "already exists but find missed"
             )
-            return Outcome(
-                ok=False,
-                reason="already exists but find missed",
-                effect_id=effect_id,
-                status="unknown",
+            return _outcome(
+                False, "already exists but find missed", effect_id, "unknown"
             )
         if not found.provider_id:
             return self._mismatch(effect_id, "empty provider_id", None)
@@ -241,9 +219,7 @@ class Executor:
                 "already exists matches effect",
                 provider_id=found.provider_id,
             )
-            return Outcome(
-                ok=True, reason="executed", effect_id=effect_id, status="executed"
-            )
+            return _outcome(True, "executed", effect_id, "executed")
         return self._mismatch(
             effect_id, "already exists differs from effect", found.provider_id
         )
@@ -254,7 +230,7 @@ class Executor:
         self._store.transition(
             effect_id, "executing", "mismatch", reason, provider_id=provider_id
         )
-        return Outcome(ok=False, reason=reason, effect_id=effect_id, status="mismatch")
+        return _outcome(False, reason, effect_id, "mismatch")
 
     @staticmethod
     def _record_matches(
@@ -274,15 +250,13 @@ class Executor:
         self._store.log_event(
             effect_id, "proposed", "proposed", f"approve refused: {reason}"
         )
-        return Outcome(ok=False, reason=reason, effect_id=effect_id, status="proposed")
+        return _outcome(False, reason, effect_id, "proposed")
 
     def _refuse_execute(self, effect_id: str, status: str, reason: str) -> Outcome:
         if status == "approved" and self._store.transition(
             effect_id, "approved", "refused", f"execute refused: {reason}"
         ):
-            return Outcome(
-                ok=False, reason=reason, effect_id=effect_id, status="refused"
-            )
+            return _outcome(False, reason, effect_id, "refused")
         return self._log_execute_refuse(status, effect_id, reason)
 
     def _refuse_corrupt(self, exc: CorruptEffectError) -> Outcome:
@@ -290,11 +264,9 @@ class Executor:
         if exc.status == "approved" and self._store.transition(
             exc.effect_id, "approved", "refused", f"execute refused: {reason}"
         ):
-            return Outcome(
-                ok=False, reason=reason, effect_id=exc.effect_id, status="refused"
-            )
+            return _outcome(False, reason, exc.effect_id, "refused")
         return self._log_execute_refuse(exc.status, exc.effect_id, reason)
 
     def _log_execute_refuse(self, status: str, effect_id: str, reason: str) -> Outcome:
         self._store.log_event(effect_id, status, status, f"execute refused: {reason}")
-        return Outcome(ok=False, reason=reason, effect_id=effect_id, status=status)
+        return _outcome(False, reason, effect_id, status)
