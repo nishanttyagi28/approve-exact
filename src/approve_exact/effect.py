@@ -30,6 +30,16 @@ class Effect:
     idempotency_key: str
 
     def __post_init__(self) -> None:
+        for name in (
+            "kind",
+            "currency",
+            "customer_email",
+            "customer_name",
+            "description",
+            "idempotency_key",
+        ):
+            if not isinstance(getattr(self, name), str):
+                raise TypeError(f"{name} must be a str")
         if self.kind != KIND_PAYMENT_LINK:
             raise ValueError(f"kind must be {KIND_PAYMENT_LINK!r}")
         if isinstance(self.amount_paise, bool) or not isinstance(

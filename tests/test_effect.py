@@ -72,6 +72,19 @@ def test_effect_rejects_bool_amount() -> None:
         )
 
 
+def test_effect_rejects_non_str_fields() -> None:
+    with pytest.raises(TypeError, match="customer_email must be a str"):
+        Effect(
+            kind="payment_link",
+            amount_paise=1,
+            currency="INR",
+            customer_email=123,  # type: ignore[arg-type]
+            customer_name="A",
+            description="x",
+            idempotency_key="k1",
+        )
+
+
 @given(effects())
 def test_key_order_does_not_change_hash(effect: Effect) -> None:
     data = effect_to_dict(effect)
