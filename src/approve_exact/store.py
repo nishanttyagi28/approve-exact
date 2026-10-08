@@ -17,8 +17,8 @@ STATUSES = frozenset(
     "proposed approved executing executed verified refused unknown mismatch".split()
 )
 ALLOWED: dict[str, frozenset[str]] = {
-    "proposed": frozenset({"approved", "refused"}),
-    "approved": frozenset({"executing", "refused"}),
+    "proposed": frozenset({"refused"}),
+    "approved": frozenset({"refused"}),
     "executing": frozenset({"executed", "unknown", "refused", "mismatch"}),
     "executed": frozenset({"verified", "mismatch"}),
     "unknown": frozenset({"executed", "mismatch", "refused"}),
@@ -42,8 +42,6 @@ BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
 
 
 class CorruptEffectError(Exception):
-    """Stored effect_json cannot be loaded as an Effect."""
-
     def __init__(self, effect_id: str, status: str, reason: str) -> None:
         super().__init__(reason)
         self.effect_id, self.status, self.reason = effect_id, status, reason
@@ -79,8 +77,6 @@ class StoredApproval:
 
 
 class Store:
-    """SQLite store with guarded transitions and thread-local connections."""
-
     def __init__(self, path: str | Path) -> None:
         self._path = str(path)
         self._local = threading.local()
@@ -105,7 +101,6 @@ class Store:
             self._local.conn = None
 
     def propose(self, effect: Effect) -> str:
-        """Insert a new effect in proposed status; return its id."""
         effect_id = str(uuid.uuid4())
         now = _iso(datetime.now(UTC))
         conn = self._connection()
@@ -120,7 +115,6 @@ class Store:
         return effect_id
 
     def get_effect(self, effect_id: str) -> EffectRow | None:
-        """Load one effect row, or None if missing."""
         row = (
             self._connection()
             .execute("SELECT * FROM effects WHERE id = ?", (effect_id,))
@@ -130,6 +124,7 @@ class Store:
             return None
         try:
             effect = Effect(**json.loads(row["effect_json"]))
+            effect_hash(effect)
         except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
             raise CorruptEffectError(effect_id, row["status"], str(exc)) from exc
         return EffectRow(
@@ -142,7 +137,6 @@ class Store:
         )
 
     def get_approval(self, effect_id: str) -> StoredApproval | None:
-        """Load the approval for an effect, or None."""
         row = (
             self._connection()
             .execute("SELECT * FROM approvals WHERE effect_id = ?", (effect_id,))
@@ -163,7 +157,6 @@ class Store:
         )
 
     def approve(self, effect_id: str, approval: Approval) -> bool:
-        """Insert approval and transition proposed->approved atomically."""
         now = _iso(datetime.now(UTC))
         conn = self._connection()
         conn.execute("BEGIN IMMEDIATE")
@@ -192,7 +185,6 @@ class Store:
             raise
 
     def claim_for_execute(self, effect_id: str) -> bool:
-        """Claim approved->executing and mark approval used, atomically."""
         now = _iso(datetime.now(UTC))
         conn = self._connection()
         conn.execute("BEGIN IMMEDIATE")
@@ -224,9 +216,12 @@ class Store:
         reason: str,
         provider_id: str | None = None,
     ) -> bool:
-        """Move status from expected to new; True only if one row updated."""
         if expected not in STATUSES or new not in STATUSES:
             raise ValueError("invalid status")
+        if (expected, new) in {("proposed", "approved"), ("approved", "executing")}:
+            raise ValueError(
+                f"transition {expected!r} -> {new!r} requires approve/claim helper"
+            )
         if new not in ALLOWED.get(expected, frozenset()):
             raise ValueError(f"transition {expected!r} -> {new!r} is not allowed")
         now = _iso(datetime.now(UTC))
@@ -246,7 +241,6 @@ class Store:
     def log_event(
         self, effect_id: str, from_status: str, to_status: str, reason: str
     ) -> None:
-        """Append an event without changing status."""
         conn = self._connection()
         self._event(
             conn, effect_id, from_status, to_status, reason, _iso(datetime.now(UTC))
@@ -254,7 +248,6 @@ class Store:
         conn.commit()
 
     def list_events(self, effect_id: str) -> list[tuple[str, str, str, str]]:
-        """Return (ts, from_status, to_status, reason) for tests."""
         rows = self._connection().execute(
             "SELECT ts, from_status, to_status, reason FROM events"
             " WHERE effect_id=? ORDER BY id",
