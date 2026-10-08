@@ -171,7 +171,7 @@ def test_execute_already_exists_differ(tmp_path: Path) -> None:
     row = store.get_effect(eid)
     assert out.status == "mismatch" and adapter.creates == 0
     assert row is not None and row.provider_id == "pre-2"
-    assert has_event(store, eid, "already exists differs from effect")
+    assert has_event(store, eid, "precheck find differs from effect")
     store.close()
 
 
@@ -194,7 +194,7 @@ def test_execute_already_exists_find_raises(tmp_path: Path) -> None:
         ex.execute(eid)
     row = store.get_effect(eid)
     assert row is not None and row.status == "unknown" and adapter.creates == 0
-    assert has_event(store, eid, "find failed:")
+    assert has_event(store, eid, "find precheck failed:")
     store.close()
 
 
