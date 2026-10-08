@@ -42,6 +42,8 @@ BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
 
 
 class CorruptEffectError(Exception):
+    """Stored effect_json cannot be loaded as an Effect."""
+
     def __init__(self, effect_id: str, status: str, reason: str) -> None:
         super().__init__(reason)
         self.effect_id, self.status, self.reason = effect_id, status, reason
@@ -54,10 +56,8 @@ def _iso(ts: datetime) -> str:
 
 
 def _parse_dt(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value)
-    return (
-        parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
-    )
+    p = datetime.fromisoformat(value)
+    return p.replace(tzinfo=UTC) if p.tzinfo is None else p.astimezone(UTC)
 
 
 @dataclass(frozen=True)
@@ -77,12 +77,13 @@ class StoredApproval:
 
 
 class Store:
+    """SQLite store with guarded transitions and thread-local connections."""
+
     def __init__(self, path: str | Path) -> None:
         self._path = str(path)
         self._local = threading.local()
-        conn = self._connection()
-        conn.executescript(_SCHEMA)
-        conn.commit()
+        self._connection().executescript(_SCHEMA)
+        self._connection().commit()
 
     def _connection(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -95,12 +96,14 @@ class Store:
         return conn
 
     def close(self) -> None:
+        """Close this thread's database connection."""
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             conn.close()
             self._local.conn = None
 
     def propose(self, effect: Effect) -> str:
+        """Insert a new effect in proposed status; return its id."""
         effect_id = str(uuid.uuid4())
         now = _iso(datetime.now(UTC))
         conn = self._connection()
@@ -115,6 +118,7 @@ class Store:
         return effect_id
 
     def get_effect(self, effect_id: str) -> EffectRow | None:
+        """Load one effect row, or None if missing."""
         row = (
             self._connection()
             .execute("SELECT * FROM effects WHERE id = ?", (effect_id,))
@@ -128,15 +132,16 @@ class Store:
         except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
             raise CorruptEffectError(effect_id, row["status"], str(exc)) from exc
         return EffectRow(
-            id=row["id"],
-            effect=effect,
-            effect_hash=row["effect_hash"],
-            status=row["status"],
-            provider_id=row["provider_id"],
-            updated_at=_parse_dt(row["updated_at"]),
+            row["id"],
+            effect,
+            row["effect_hash"],
+            row["status"],
+            row["provider_id"],
+            _parse_dt(row["updated_at"]),
         )
 
     def get_approval(self, effect_id: str) -> StoredApproval | None:
+        """Load the approval for an effect, or None."""
         row = (
             self._connection()
             .execute("SELECT * FROM approvals WHERE effect_id = ?", (effect_id,))
@@ -146,17 +151,18 @@ class Store:
             return None
         used = row["used_at"]
         return StoredApproval(
-            approval=Approval(
-                effect_hash=row["effect_hash"],
-                approver=row["approver"],
-                approved_at=_parse_dt(row["approved_at"]),
-                expires_at=_parse_dt(row["expires_at"]),
-                signature=row["signature"],
+            Approval(
+                row["effect_hash"],
+                row["approver"],
+                _parse_dt(row["approved_at"]),
+                _parse_dt(row["expires_at"]),
+                row["signature"],
             ),
-            used_at=None if used is None else _parse_dt(used),
+            None if used is None else _parse_dt(used),
         )
 
     def approve(self, effect_id: str, approval: Approval) -> bool:
+        """Insert approval and transition proposed->approved atomically."""
         now = _iso(datetime.now(UTC))
         conn = self._connection()
         conn.execute("BEGIN IMMEDIATE")
@@ -185,6 +191,7 @@ class Store:
             raise
 
     def claim_for_execute(self, effect_id: str) -> bool:
+        """Claim approved->executing and mark approval used, atomically."""
         now = _iso(datetime.now(UTC))
         conn = self._connection()
         conn.execute("BEGIN IMMEDIATE")
@@ -216,6 +223,7 @@ class Store:
         reason: str,
         provider_id: str | None = None,
     ) -> bool:
+        """Move status from expected to new; True only if one row updated."""
         if expected not in STATUSES or new not in STATUSES:
             raise ValueError("invalid status")
         if (expected, new) in {("proposed", "approved"), ("approved", "executing")}:
@@ -241,18 +249,19 @@ class Store:
     def log_event(
         self, effect_id: str, from_status: str, to_status: str, reason: str
     ) -> None:
+        """Append an event without changing status."""
         conn = self._connection()
-        self._event(
-            conn, effect_id, from_status, to_status, reason, _iso(datetime.now(UTC))
-        )
+        now = _iso(datetime.now(UTC))
+        self._event(conn, effect_id, from_status, to_status, reason, now)
         conn.commit()
 
     def list_events(self, effect_id: str) -> list[tuple[str, str, str, str]]:
-        rows = self._connection().execute(
+        """Return (ts, from_status, to_status, reason) for tests."""
+        sql = (
             "SELECT ts, from_status, to_status, reason FROM events"
-            " WHERE effect_id=? ORDER BY id",
-            (effect_id,),
+            " WHERE effect_id=? ORDER BY id"
         )
+        rows = self._connection().execute(sql, (effect_id,))
         return [(r[0], r[1], r[2], r[3]) for r in rows.fetchall()]
 
     @staticmethod
@@ -265,17 +274,15 @@ class Store:
         provider_id: str | None = None,
     ) -> int:
         if provider_id is None:
-            cur = conn.execute(
-                "UPDATE effects SET status=?, updated_at=? WHERE id=? AND status=?",
-                (new, now, effect_id, expected),
-            )
+            sql = "UPDATE effects SET status=?, updated_at=? WHERE id=? AND status=?"
+            args: tuple[object, ...] = (new, now, effect_id, expected)
         else:
-            cur = conn.execute(
+            sql = (
                 "UPDATE effects SET status=?, updated_at=?, provider_id=?"
-                " WHERE id=? AND status=?",
-                (new, now, provider_id, effect_id, expected),
+                " WHERE id=? AND status=?"
             )
-        return cur.rowcount
+            args = (new, now, provider_id, effect_id, expected)
+        return conn.execute(sql, args).rowcount
 
     @staticmethod
     def _event(
