@@ -14,35 +14,56 @@ from approve_exact.approval import Approval
 from approve_exact.effect import Effect, effect_hash, effect_to_dict
 
 STATUSES = frozenset(
-    {
-        "proposed",
-        "approved",
-        "executing",
-        "executed",
-        "verified",
-        "refused",
-        "unknown",
-        "mismatch",
-    }
+    "proposed approved executing executed verified refused unknown mismatch".split()
 )
+ALLOWED: dict[str, frozenset[str]] = {
+    "proposed": frozenset({"approved", "refused"}),
+    "approved": frozenset({"executing", "refused"}),
+    "executing": frozenset({"executed", "unknown", "refused", "mismatch"}),
+    "executed": frozenset({"verified", "mismatch"}),
+    "unknown": frozenset({"executed", "mismatch", "refused"}),
+}
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS effects (
+  id TEXT PRIMARY KEY, effect_json TEXT NOT NULL, effect_hash TEXT NOT NULL,
+  status TEXT NOT NULL, provider_id TEXT, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS approvals (
+  effect_id TEXT PRIMARY KEY REFERENCES effects(id), effect_hash TEXT NOT NULL,
+  approver TEXT NOT NULL, approved_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+  signature TEXT NOT NULL, used_at TEXT);
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, effect_id TEXT NOT NULL,
+  from_status TEXT NOT NULL, to_status TEXT NOT NULL, reason TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
+BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
+BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+"""
 
 
-def _now() -> datetime:
-    return datetime.now(UTC)
+class CorruptEffectError(Exception):
+    """Stored effect_json cannot be loaded as an Effect."""
+
+    def __init__(self, effect_id: str, status: str, reason: str) -> None:
+        super().__init__(reason)
+        self.effect_id, self.status, self.reason = effect_id, status, reason
 
 
 def _iso(ts: datetime) -> str:
-    return ts.isoformat()
+    if ts.tzinfo is None:
+        raise ValueError("timestamps must be timezone-aware")
+    return ts.astimezone(UTC).isoformat()
 
 
 def _parse_dt(value: str) -> datetime:
-    return datetime.fromisoformat(value)
+    parsed = datetime.fromisoformat(value)
+    return (
+        parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    )
 
 
 @dataclass(frozen=True)
 class EffectRow:
-    """One effects table row."""
-
     id: str
     effect: Effect
     effect_hash: str
@@ -51,106 +72,109 @@ class EffectRow:
     updated_at: datetime
 
 
+@dataclass(frozen=True)
+class StoredApproval:
+    approval: Approval
+    used_at: datetime | None
+
+
 class Store:
-    """SQLite store; all status changes go through transition()."""
+    """SQLite store with guarded transitions and thread-local connections."""
 
     def __init__(self, path: str | Path) -> None:
         self._path = str(path)
-        self._lock = threading.Lock()
-        self._conn = sqlite3.connect(
-            self._path,
-            timeout=30,
-            check_same_thread=False,
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=30000")
-        self._create_schema()
+        self._local = threading.local()
+        conn = self._connection()
+        conn.executescript(_SCHEMA)
+        conn.commit()
+
+    def _connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self._path, timeout=30)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            self._local.conn = conn
+        return conn
 
     def close(self) -> None:
-        """Close the database connection."""
-        self._conn.close()
-
-    def _create_schema(self) -> None:
-        self._conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS effects (
-                id TEXT PRIMARY KEY,
-                effect_json TEXT NOT NULL,
-                effect_hash TEXT NOT NULL,
-                status TEXT NOT NULL,
-                provider_id TEXT,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS approvals (
-                effect_id TEXT PRIMARY KEY REFERENCES effects(id),
-                effect_hash TEXT NOT NULL,
-                approver TEXT NOT NULL,
-                approved_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                signature TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                effect_id TEXT NOT NULL,
-                from_status TEXT NOT NULL,
-                to_status TEXT NOT NULL,
-                reason TEXT NOT NULL
-            );
-            """
-        )
-        self._conn.commit()
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
     def propose(self, effect: Effect) -> str:
         """Insert a new effect in proposed status; return its id."""
         effect_id = str(uuid.uuid4())
-        digest = effect_hash(effect)
-        now = _iso(_now())
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO effects
-                (id, effect_json, effect_hash, status, provider_id, updated_at)
-                VALUES (?, ?, ?, 'proposed', NULL, ?)
-                """,
-                (effect_id, json.dumps(effect_to_dict(effect)), digest, now),
-            )
-            self._insert_event(effect_id, "proposed", "proposed", "proposed", now)
-            self._conn.commit()
+        now = _iso(datetime.now(UTC))
+        conn = self._connection()
+        conn.execute(
+            "INSERT INTO effects"
+            " (id, effect_json, effect_hash, status, provider_id, updated_at)"
+            " VALUES (?, ?, ?, 'proposed', NULL, ?)",
+            (effect_id, json.dumps(effect_to_dict(effect)), effect_hash(effect), now),
+        )
+        self._event(conn, effect_id, "proposed", "proposed", "proposed", now)
+        conn.commit()
         return effect_id
 
     def get_effect(self, effect_id: str) -> EffectRow | None:
-        """Load one effect row, or None."""
-        cur = self._conn.execute("SELECT * FROM effects WHERE id = ?", (effect_id,))
-        row = cur.fetchone()
+        """Load one effect row, or None if missing."""
+        row = (
+            self._connection()
+            .execute("SELECT * FROM effects WHERE id = ?", (effect_id,))
+            .fetchone()
+        )
         if row is None:
             return None
-        data = json.loads(row["effect_json"])
+        try:
+            effect = Effect(**json.loads(row["effect_json"]))
+        except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+            raise CorruptEffectError(effect_id, row["status"], str(exc)) from exc
         return EffectRow(
             id=row["id"],
-            effect=Effect(**data),
+            effect=effect,
             effect_hash=row["effect_hash"],
             status=row["status"],
             provider_id=row["provider_id"],
             updated_at=_parse_dt(row["updated_at"]),
         )
 
-    def save_approval(self, effect_id: str, approval: Approval) -> None:
-        """Upsert the approval row for an effect."""
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO approvals
-                (effect_id, effect_hash, approver, approved_at, expires_at, signature)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(effect_id) DO UPDATE SET
-                    effect_hash=excluded.effect_hash,
-                    approver=excluded.approver,
-                    approved_at=excluded.approved_at,
-                    expires_at=excluded.expires_at,
-                    signature=excluded.signature
-                """,
+    def get_approval(self, effect_id: str) -> StoredApproval | None:
+        """Load the approval for an effect, or None."""
+        row = (
+            self._connection()
+            .execute("SELECT * FROM approvals WHERE effect_id = ?", (effect_id,))
+            .fetchone()
+        )
+        if row is None:
+            return None
+        used = row["used_at"]
+        return StoredApproval(
+            approval=Approval(
+                effect_hash=row["effect_hash"],
+                approver=row["approver"],
+                approved_at=_parse_dt(row["approved_at"]),
+                expires_at=_parse_dt(row["expires_at"]),
+                signature=row["signature"],
+            ),
+            used_at=None if used is None else _parse_dt(used),
+        )
+
+    def approve(self, effect_id: str, approval: Approval) -> bool:
+        """Insert approval and transition proposed->approved atomically."""
+        now = _iso(datetime.now(UTC))
+        conn = self._connection()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if self._set_status(conn, effect_id, "proposed", "approved", now) != 1:
+                conn.rollback()
+                return False
+            conn.execute(
+                "INSERT INTO approvals (effect_id, effect_hash, approver,"
+                " approved_at, expires_at, signature, used_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, NULL)",
                 (
                     effect_id,
                     approval.effect_hash,
@@ -160,90 +184,117 @@ class Store:
                     approval.signature,
                 ),
             )
-            self._conn.commit()
+            self._event(conn, effect_id, "proposed", "approved", "human approved", now)
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
 
-    def get_approval(self, effect_id: str) -> Approval | None:
-        """Load the approval for an effect, or None."""
-        cur = self._conn.execute(
-            "SELECT * FROM approvals WHERE effect_id = ?", (effect_id,)
-        )
-        row = cur.fetchone()
-        if row is None:
-            return None
-        return Approval(
-            effect_hash=row["effect_hash"],
-            approver=row["approver"],
-            approved_at=_parse_dt(row["approved_at"]),
-            expires_at=_parse_dt(row["expires_at"]),
-            signature=row["signature"],
-        )
-
-    def set_provider_id(self, effect_id: str, provider_id: str) -> None:
-        """Store the provider object id on the effect row."""
-        now = _iso(_now())
-        with self._lock:
-            self._conn.execute(
-                """
-                UPDATE effects SET provider_id = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (provider_id, now, effect_id),
-            )
-            self._conn.commit()
-
-    def transition(self, effect_id: str, expected: str, new: str, reason: str) -> bool:
-        """Move status from expected to new; return True only if one row updated."""
-        if new not in STATUSES or expected not in STATUSES:
-            raise ValueError("invalid status")
-        now = _iso(_now())
-        with self._lock:
-            cur = self._conn.execute(
-                """
-                UPDATE effects
-                SET status = ?, updated_at = ?
-                WHERE id = ? AND status = ?
-                """,
-                (new, now, effect_id, expected),
+    def claim_for_execute(self, effect_id: str) -> bool:
+        """Claim approved->executing and mark approval used, atomically."""
+        now = _iso(datetime.now(UTC))
+        conn = self._connection()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if self._set_status(conn, effect_id, "approved", "executing", now) != 1:
+                conn.rollback()
+                return False
+            cur = conn.execute(
+                "UPDATE approvals SET used_at=? WHERE effect_id=? AND used_at IS NULL",
+                (now, effect_id),
             )
             if cur.rowcount != 1:
-                self._conn.rollback()
+                conn.rollback()
                 return False
-            self._insert_event(effect_id, expected, new, reason, now)
-            self._conn.commit()
+            self._event(
+                conn, effect_id, "approved", "executing", "claimed for execute", now
+            )
+            conn.commit()
             return True
+        except Exception:
+            conn.rollback()
+            raise
+
+    def transition(
+        self,
+        effect_id: str,
+        expected: str,
+        new: str,
+        reason: str,
+        provider_id: str | None = None,
+    ) -> bool:
+        """Move status from expected to new; True only if one row updated."""
+        if expected not in STATUSES or new not in STATUSES:
+            raise ValueError("invalid status")
+        if new not in ALLOWED.get(expected, frozenset()):
+            raise ValueError(f"transition {expected!r} -> {new!r} is not allowed")
+        now = _iso(datetime.now(UTC))
+        conn = self._connection()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if self._set_status(conn, effect_id, expected, new, now, provider_id) != 1:
+                conn.rollback()
+                return False
+            self._event(conn, effect_id, expected, new, reason, now)
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
 
     def log_event(
         self, effect_id: str, from_status: str, to_status: str, reason: str
     ) -> None:
         """Append an event without changing status."""
-        now = _iso(_now())
-        with self._lock:
-            self._insert_event(effect_id, from_status, to_status, reason, now)
-            self._conn.commit()
+        conn = self._connection()
+        self._event(
+            conn, effect_id, from_status, to_status, reason, _iso(datetime.now(UTC))
+        )
+        conn.commit()
 
     def list_events(self, effect_id: str) -> list[tuple[str, str, str, str]]:
-        """Return (ts, from_status, to_status, reason) rows for tests."""
-        cur = self._conn.execute(
-            """
-            SELECT ts, from_status, to_status, reason
-            FROM events WHERE effect_id = ? ORDER BY id
-            """,
+        """Return (ts, from_status, to_status, reason) for tests."""
+        rows = self._connection().execute(
+            "SELECT ts, from_status, to_status, reason FROM events"
+            " WHERE effect_id=? ORDER BY id",
             (effect_id,),
         )
-        return [(r[0], r[1], r[2], r[3]) for r in cur.fetchall()]
+        return [(r[0], r[1], r[2], r[3]) for r in rows.fetchall()]
 
-    def _insert_event(
-        self,
+    @staticmethod
+    def _set_status(
+        conn: sqlite3.Connection,
+        effect_id: str,
+        expected: str,
+        new: str,
+        now: str,
+        provider_id: str | None = None,
+    ) -> int:
+        if provider_id is None:
+            cur = conn.execute(
+                "UPDATE effects SET status=?, updated_at=? WHERE id=? AND status=?",
+                (new, now, effect_id, expected),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE effects SET status=?, updated_at=?, provider_id=?"
+                " WHERE id=? AND status=?",
+                (new, now, provider_id, effect_id, expected),
+            )
+        return cur.rowcount
+
+    @staticmethod
+    def _event(
+        conn: sqlite3.Connection,
         effect_id: str,
         from_status: str,
         to_status: str,
         reason: str,
         ts: str,
     ) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO events (ts, effect_id, from_status, to_status, reason)
-            VALUES (?, ?, ?, ?, ?)
-            """,
+        conn.execute(
+            "INSERT INTO events (ts, effect_id, from_status, to_status, reason)"
+            " VALUES (?, ?, ?, ?, ?)",
             (ts, effect_id, from_status, to_status, reason),
         )
