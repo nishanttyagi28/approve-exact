@@ -112,7 +112,9 @@ def test_happy_path(tmp_path: Path) -> None:
     assert eid
     approve(ex, store, eid)
     out = ex.execute(eid)
+    row = store.get_effect(eid)
     assert out.ok and out.status == "executed" and adapter.creates == 1
+    assert row is not None and row.provider_id == "stub_1"
     store.close()
 
 
