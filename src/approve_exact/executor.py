@@ -12,6 +12,7 @@ from approve_exact.adapters.base import (
     ProviderError,
     ProviderRecord,
     ProviderTimeout,
+    record_matches,
 )
 from approve_exact.approval import Approval, verify
 from approve_exact.effect import Effect, effect_hash
@@ -29,10 +30,7 @@ class Outcome:
 
 
 def _outcome(
-    ok: bool,
-    reason: str,
-    effect_id: str | None = None,
-    status: str | None = None,
+    ok: bool, reason: str, effect_id: str | None = None, status: str | None = None
 ) -> Outcome:
     return Outcome(ok=ok, reason=reason, effect_id=effect_id, status=status)
 
@@ -158,6 +156,22 @@ class Executor:
         self, effect_id: str, effect: Effect, recomputed: str
     ) -> Outcome:
         try:
+            preexisting = self._adapter.find(effect.idempotency_key)
+        except Exception as exc:
+            self._store.transition(
+                effect_id, "executing", "unknown", f"find precheck failed: {exc}"
+            )
+            raise
+        if preexisting is not None:
+            return self._apply_found(
+                effect_id,
+                effect,
+                recomputed,
+                preexisting,
+                matched="precheck find matches effect",
+                differed="precheck find differs from effect",
+            )
+        try:
             record = self._adapter.create(effect, recomputed)
         except ProviderTimeout:
             self._store.transition(
@@ -178,7 +192,7 @@ class Executor:
             raise
         if not record.provider_id:
             return self._mismatch(effect_id, "empty provider_id", None)
-        if not self._record_matches(effect, recomputed, record):
+        if not record_matches(effect, recomputed, record):
             return self._mismatch(
                 effect_id, "provider record does not match effect", record.provider_id
             )
@@ -209,20 +223,37 @@ class Executor:
             return _outcome(
                 False, "already exists but find missed", effect_id, "unknown"
             )
+        return self._apply_found(
+            effect_id,
+            effect,
+            recomputed,
+            found,
+            matched="already exists matches effect",
+            differed="already exists differs from effect",
+        )
+
+    def _apply_found(
+        self,
+        effect_id: str,
+        effect: Effect,
+        recomputed: str,
+        found: ProviderRecord,
+        *,
+        matched: str,
+        differed: str,
+    ) -> Outcome:
         if not found.provider_id:
             return self._mismatch(effect_id, "empty provider_id", None)
-        if self._record_matches(effect, recomputed, found):
+        if record_matches(effect, recomputed, found):
             self._store.transition(
                 effect_id,
                 "executing",
                 "executed",
-                "already exists matches effect",
+                matched,
                 provider_id=found.provider_id,
             )
             return _outcome(True, "executed", effect_id, "executed")
-        return self._mismatch(
-            effect_id, "already exists differs from effect", found.provider_id
-        )
+        return self._mismatch(effect_id, differed, found.provider_id)
 
     def _mismatch(
         self, effect_id: str, reason: str, provider_id: str | None
@@ -231,20 +262,6 @@ class Executor:
             effect_id, "executing", "mismatch", reason, provider_id=provider_id
         )
         return _outcome(False, reason, effect_id, "mismatch")
-
-    @staticmethod
-    def _record_matches(
-        effect: Effect, recomputed: str, record: ProviderRecord
-    ) -> bool:
-        return (
-            record.idempotency_key == effect.idempotency_key
-            and record.effect_hash == recomputed
-            and record.amount_paise == effect.amount_paise
-            and record.currency == effect.currency
-            and record.customer_email == effect.customer_email
-            and record.customer_name == effect.customer_name
-            and record.description == effect.description
-        )
 
     def _refuse_approve(self, effect_id: str, reason: str) -> Outcome:
         self._store.log_event(

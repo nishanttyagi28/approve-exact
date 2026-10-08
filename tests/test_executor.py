@@ -27,8 +27,14 @@ class StubAdapter:
         self.raise_on_find: Exception | None = None
         self.exist_record: ProviderRecord | None = None
         self.create_overrides: dict[str, object] = {}
+        self.find_queue: list[ProviderRecord | None | BaseException] | None = None
 
     def find(self, key: str) -> ProviderRecord | None:
+        if self.find_queue is not None:
+            item = self.find_queue.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
         if self.raise_on_find is not None:
             raise self.raise_on_find
         if self.exist_record and self.exist_record.idempotency_key == key:

@@ -34,6 +34,19 @@ class ProviderRecord:
     effect_hash: str
 
 
+def record_matches(effect: Effect, digest: str, record: ProviderRecord) -> bool:
+    """True when the provider record matches the effect field by field."""
+    return (
+        record.idempotency_key == effect.idempotency_key
+        and record.effect_hash == digest
+        and record.amount_paise == effect.amount_paise
+        and record.currency == effect.currency
+        and record.customer_email == effect.customer_email
+        and record.customer_name == effect.customer_name
+        and record.description == effect.description
+    )
+
+
 class Adapter(Protocol):
     """Creates and looks up provider objects by idempotency key."""
 

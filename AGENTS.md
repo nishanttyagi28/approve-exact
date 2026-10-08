@@ -4,7 +4,7 @@
 
 An AI agent may propose a payment, but a provider call happens only if a human approved that exact effect hash (`sha256("approve-exact/v1\n" + canonical_json(effect))`, including amount in paise, currency, customer, description, and idempotency key), the HMAC-signed approval is valid and unused at execute time, the row is claimed once, and the provider is called with that same key (timeouts go to `unknown` and are reconciled, never resent with a new key; `verify` re-reads the provider record field by field).
 
-Planned layout: `src/approve_exact/{__init__,effect,approval,store,executor,cli}.py`, `src/approve_exact/adapters/{__init__,base,fake,razorpay}.py`, `tests/test_{effect,approval,store,executor,razorpay,razorpay_live,cli}.py`, `examples/agent_demo.py`, `README.md`, `THREAT_MODEL.md`, `AGENTS.md`, `LICENSE`, `pyproject.toml`, `.gitignore`, `.env.example`, `.github/workflows/ci.yml`.
+Planned layout: `src/approve_exact/{__init__,effect,approval,store,schema,executor,reconcile,cli}.py`, `src/approve_exact/adapters/{__init__,base,fake,razorpay}.py`, `tests/test_{effect,approval,store,executor,reconcile,reconcile_edges,razorpay,razorpay_live,cli}.py`, `examples/agent_demo.py`, `README.md`, `THREAT_MODEL.md`, `AGENTS.md`, `LICENSE`, `pyproject.toml`, `.gitignore`, `.env.example`, `.github/workflows/ci.yml`.
 
 ## Commands
 
