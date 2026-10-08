@@ -83,3 +83,18 @@ def test_verify_empty_secret_false() -> None:
         signature="00",
     )
     assert verify(approval, "") is False
+
+
+def test_naive_datetime_rejected() -> None:
+    naive = datetime(2026, 1, 1, 12, 0, 0)
+    aware = datetime(2026, 1, 1, 13, 0, 0, tzinfo=UTC)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        sign("a" * 64, "human", naive, aware, "secret")
+    with pytest.raises(ValueError, match="timezone-aware"):
+        Approval(
+            effect_hash="a" * 64,
+            approver="human",
+            approved_at=naive,
+            expires_at=aware,
+            signature="00",
+        )

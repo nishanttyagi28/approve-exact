@@ -5,7 +5,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+
+
+def _require_utc(value: datetime, name: str) -> datetime:
+    if value.tzinfo is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    return value.astimezone(UTC)
 
 
 def _sign_message(
@@ -32,9 +38,15 @@ class Approval:
     expires_at: datetime
     signature: str
 
+    def __post_init__(self) -> None:
+        approved = _require_utc(self.approved_at, "approved_at")
+        expires = _require_utc(self.expires_at, "expires_at")
+        object.__setattr__(self, "approved_at", approved)
+        object.__setattr__(self, "expires_at", expires)
+
     def is_expired(self, now: datetime) -> bool:
-        """True when now is at or past expires_at."""
-        return now >= self.expires_at
+        """True when now is at or past expires_at (both compared in UTC)."""
+        return _require_utc(now, "now") >= self.expires_at
 
 
 def sign(
@@ -47,6 +59,8 @@ def sign(
     """Build an Approval with an HMAC-SHA256 signature."""
     if not secret:
         raise ValueError("secret must be non-empty")
+    approved_at = _require_utc(approved_at, "approved_at")
+    expires_at = _require_utc(expires_at, "expires_at")
     if expires_at <= approved_at:
         raise ValueError("expires_at must be after approved_at")
     digest = hmac.new(
