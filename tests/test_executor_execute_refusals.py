@@ -198,6 +198,54 @@ def test_execute_already_exists_find_raises(tmp_path: Path) -> None:
     store.close()
 
 
+def test_execute_already_exists_race_match(tmp_path: Path) -> None:
+    _db, store, adapter, ex = make_env(tmp_path, name="race_m")
+    effect = make_effect()
+    eid = ex.propose(effect).effect_id
+    assert eid
+    approve(ex, store, eid)
+    adapter.find_queue = [None, existing(effect, provider_id="race-1")]
+    adapter.raise_on_create = AlreadyExists()
+    out = ex.execute(eid)
+    row = store.get_effect(eid)
+    assert out.status == "executed" and out.ok and adapter.creates == 0
+    assert row is not None and row.provider_id == "race-1"
+    assert has_event(store, eid, "already exists matches effect")
+    store.close()
+
+
+def test_execute_already_exists_race_differ(tmp_path: Path) -> None:
+    _db, store, adapter, ex = make_env(tmp_path, name="race_d")
+    effect = make_effect()
+    eid = ex.propose(effect).effect_id
+    assert eid
+    approve(ex, store, eid)
+    adapter.find_queue = [
+        None,
+        existing(effect, provider_id="race-2", amount_paise=effect.amount_paise + 1),
+    ]
+    adapter.raise_on_create = AlreadyExists()
+    out = ex.execute(eid)
+    row = store.get_effect(eid)
+    assert out.status == "mismatch" and adapter.creates == 0
+    assert row is not None and row.provider_id == "race-2"
+    assert has_event(store, eid, "already exists differs from effect")
+    store.close()
+
+
+def test_execute_already_exists_race_find_raises(tmp_path: Path) -> None:
+    _db, store, adapter, ex, eid = _proposed(tmp_path, name="race_r")
+    approve(ex, store, eid)
+    adapter.find_queue = [None, RuntimeError("find boom")]
+    adapter.raise_on_create = AlreadyExists()
+    with pytest.raises(RuntimeError, match="find boom"):
+        ex.execute(eid)
+    row = store.get_effect(eid)
+    assert row is not None and row.status == "unknown" and adapter.creates == 0
+    assert has_event(store, eid, "find failed:")
+    store.close()
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
