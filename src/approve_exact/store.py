@@ -12,35 +12,8 @@ from pathlib import Path
 
 from approve_exact.approval import Approval
 from approve_exact.effect import Effect, effect_hash, effect_to_dict
+from approve_exact.schema import ALLOWED, RESERVED, SCHEMA_SQL, STATUSES
 
-STATUSES = frozenset(
-    "proposed approved executing executed verified refused unknown mismatch".split()
-)
-ALLOWED: dict[str, frozenset[str]] = {
-    "proposed": frozenset({"refused"}),
-    "approved": frozenset({"refused"}),
-    "executing": frozenset({"executed", "unknown", "refused", "mismatch"}),
-    "executed": frozenset({"verified", "mismatch"}),
-    "unknown": frozenset({"mismatch", "refused"}),
-}
-# fmt: off
-_RESERVED = frozenset({
-    ("proposed", "approved"), ("approved", "executing"), ("unknown", "executed"),
-})
-_SCHEMA = (
-    "CREATE TABLE IF NOT EXISTS effects ("
-    " id TEXT PRIMARY KEY, effect_json TEXT NOT NULL, effect_hash TEXT NOT NULL,"
-    " status TEXT NOT NULL, provider_id TEXT, updated_at TEXT NOT NULL);"
-    "CREATE TABLE IF NOT EXISTS approvals ("
-    " effect_id TEXT PRIMARY KEY REFERENCES effects(id), effect_hash TEXT NOT NULL,"
-    " approver TEXT NOT NULL, approved_at TEXT NOT NULL, expires_at TEXT NOT NULL,"
-    " signature TEXT NOT NULL, used_at TEXT);"
-    "CREATE TABLE IF NOT EXISTS events ("
-    " id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, effect_id TEXT NOT NULL,"
-    " from_status TEXT NOT NULL, to_status TEXT NOT NULL, reason TEXT NOT NULL);"
-    "CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;"  # noqa: E501
-    "CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;"  # noqa: E501
-)
 
 class CorruptEffectError(Exception):
     """Stored effect_json cannot be loaded as an Effect."""
@@ -49,15 +22,16 @@ class CorruptEffectError(Exception):
         super().__init__(reason)
         self.effect_id, self.status, self.reason = effect_id, status, reason
 
+
 def _iso(ts: datetime) -> str:
     if ts.tzinfo is None:
         raise ValueError("timestamps must be timezone-aware")
     return ts.astimezone(UTC).isoformat()
 
+
 def _parse_dt(value: str) -> datetime:
     p = datetime.fromisoformat(value)
     return p.replace(tzinfo=UTC) if p.tzinfo is None else p.astimezone(UTC)
-# fmt: on
 
 
 @dataclass(frozen=True)
@@ -82,7 +56,7 @@ class Store:
     def __init__(self, path: str | Path) -> None:
         self._path = str(path)
         self._local = threading.local()
-        self._connection().executescript(_SCHEMA)
+        self._connection().executescript(SCHEMA_SQL)
         self._connection().commit()
 
     def _connection(self) -> sqlite3.Connection:
@@ -117,12 +91,13 @@ class Store:
         conn.commit()
         return effect_id
 
-    # fmt: off
     def get_effect(self, effect_id: str) -> EffectRow | None:
         """Load one effect row, or None if missing."""
-        row = self._connection().execute(
-            "SELECT * FROM effects WHERE id = ?", (effect_id,),
-        ).fetchone()
+        row = (
+            self._connection()
+            .execute("SELECT * FROM effects WHERE id = ?", (effect_id,))
+            .fetchone()
+        )
         if row is None:
             return None
         try:
@@ -131,27 +106,34 @@ class Store:
         except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
             raise CorruptEffectError(effect_id, row["status"], str(exc)) from exc
         return EffectRow(
-            row["id"], effect, row["effect_hash"], row["status"],
-            row["provider_id"], _parse_dt(row["updated_at"]),
+            row["id"],
+            effect,
+            row["effect_hash"],
+            row["status"],
+            row["provider_id"],
+            _parse_dt(row["updated_at"]),
         )
 
     def get_approval(self, effect_id: str) -> StoredApproval | None:
         """Load the approval for an effect, or None."""
-        row = self._connection().execute(
-            "SELECT * FROM approvals WHERE effect_id = ?", (effect_id,),
-        ).fetchone()
+        row = (
+            self._connection()
+            .execute("SELECT * FROM approvals WHERE effect_id = ?", (effect_id,))
+            .fetchone()
+        )
         if row is None:
             return None
         used = row["used_at"]
         return StoredApproval(
             Approval(
-                row["effect_hash"], row["approver"],
-                _parse_dt(row["approved_at"]), _parse_dt(row["expires_at"]),
+                row["effect_hash"],
+                row["approver"],
+                _parse_dt(row["approved_at"]),
+                _parse_dt(row["expires_at"]),
                 row["signature"],
             ),
             None if used is None else _parse_dt(used),
         )
-    # fmt: on
 
     def approve(self, effect_id: str, approval: Approval) -> bool:
         """Insert approval and transition proposed->approved atomically."""
@@ -162,18 +144,19 @@ class Store:
             if self._set_status(conn, effect_id, "proposed", "approved", now) != 1:
                 conn.rollback()
                 return False
-            # fmt: off
             conn.execute(
                 "INSERT INTO approvals (effect_id, effect_hash, approver,"
                 " approved_at, expires_at, signature, used_at)"
                 " VALUES (?, ?, ?, ?, ?, ?, NULL)",
                 (
-                    effect_id, approval.effect_hash, approval.approver,
-                    _iso(approval.approved_at), _iso(approval.expires_at),
+                    effect_id,
+                    approval.effect_hash,
+                    approval.approver,
+                    _iso(approval.approved_at),
+                    _iso(approval.expires_at),
                     approval.signature,
                 ),
             )
-            # fmt: on
             self._event(conn, effect_id, "proposed", "approved", "human approved", now)
             conn.commit()
             return True
@@ -206,24 +189,30 @@ class Store:
             conn.rollback()
             raise
 
-    # fmt: off
     def mark_reconciled(self, effect_id: str, provider_id: str) -> bool:
         """Move unknown->executed with provider_id; for reconcile only."""
         if not provider_id:
             raise ValueError("provider_id must be non-empty")
         return self._apply_transition(
-            effect_id, "unknown", "executed",
-            "reconcile: provider record found", provider_id,
+            effect_id,
+            "unknown",
+            "executed",
+            "reconcile: provider record found",
+            provider_id,
         )
 
     def transition(
-        self, effect_id: str, expected: str, new: str, reason: str,
+        self,
+        effect_id: str,
+        expected: str,
+        new: str,
+        reason: str,
         provider_id: str | None = None,
     ) -> bool:
         """Move status from expected to new; True only if one row updated."""
         if expected not in STATUSES or new not in STATUSES:
             raise ValueError("invalid status")
-        if (expected, new) in _RESERVED:
+        if (expected, new) in RESERVED:
             raise ValueError(
                 f"transition {expected!r} -> {new!r} requires a dedicated helper"
             )
@@ -232,12 +221,12 @@ class Store:
         return self._apply_transition(effect_id, expected, new, reason, provider_id)
 
     def log_event(
-        self, effect_id: str, from_status: str, to_status: str, reason: str,
+        self, effect_id: str, from_status: str, to_status: str, reason: str
     ) -> None:
         """Append an event without changing status."""
         conn = self._connection()
         self._event(
-            conn, effect_id, from_status, to_status, reason, _iso(datetime.now(UTC)),
+            conn, effect_id, from_status, to_status, reason, _iso(datetime.now(UTC))
         )
         conn.commit()
 
@@ -251,7 +240,11 @@ class Store:
         return [(r[0], r[1], r[2], r[3]) for r in rows.fetchall()]
 
     def _apply_transition(
-        self, effect_id: str, expected: str, new: str, reason: str,
+        self,
+        effect_id: str,
+        expected: str,
+        new: str,
+        reason: str,
         provider_id: str | None = None,
     ) -> bool:
         now = _iso(datetime.now(UTC))
@@ -270,7 +263,11 @@ class Store:
 
     @staticmethod
     def _set_status(
-        conn: sqlite3.Connection, effect_id: str, expected: str, new: str, now: str,
+        conn: sqlite3.Connection,
+        effect_id: str,
+        expected: str,
+        new: str,
+        now: str,
         provider_id: str | None = None,
     ) -> int:
         if provider_id is None:
@@ -286,12 +283,15 @@ class Store:
 
     @staticmethod
     def _event(
-        conn: sqlite3.Connection, effect_id: str, from_status: str, to_status: str,
-        reason: str, ts: str,
+        conn: sqlite3.Connection,
+        effect_id: str,
+        from_status: str,
+        to_status: str,
+        reason: str,
+        ts: str,
     ) -> None:
         conn.execute(
             "INSERT INTO events (ts, effect_id, from_status, to_status, reason)"
             " VALUES (?, ?, ?, ?, ?)",
             (ts, effect_id, from_status, to_status, reason),
         )
-    # fmt: on
