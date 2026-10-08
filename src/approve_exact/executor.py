@@ -12,6 +12,7 @@ from approve_exact.adapters.base import (
     ProviderError,
     ProviderRecord,
     ProviderTimeout,
+    record_matches,
 )
 from approve_exact.approval import Approval, verify
 from approve_exact.effect import Effect, effect_hash
@@ -191,7 +192,7 @@ class Executor:
             raise
         if not record.provider_id:
             return self._mismatch(effect_id, "empty provider_id", None)
-        if not self._record_matches(effect, recomputed, record):
+        if not record_matches(effect, recomputed, record):
             return self._mismatch(
                 effect_id, "provider record does not match effect", record.provider_id
             )
@@ -243,7 +244,7 @@ class Executor:
     ) -> Outcome:
         if not found.provider_id:
             return self._mismatch(effect_id, "empty provider_id", None)
-        if self._record_matches(effect, recomputed, found):
+        if record_matches(effect, recomputed, found):
             self._store.transition(
                 effect_id,
                 "executing",
@@ -261,19 +262,6 @@ class Executor:
             effect_id, "executing", "mismatch", reason, provider_id=provider_id
         )
         return _outcome(False, reason, effect_id, "mismatch")
-
-    @staticmethod
-    def _record_matches(effect: Effect, digest: str, record: ProviderRecord) -> bool:
-        e, r = effect, record
-        return (
-            r.idempotency_key == e.idempotency_key
-            and r.effect_hash == digest
-            and r.amount_paise == e.amount_paise
-            and r.currency == e.currency
-            and r.customer_email == e.customer_email
-            and r.customer_name == e.customer_name
-            and r.description == e.description
-        )
 
     def _refuse_approve(self, effect_id: str, reason: str) -> Outcome:
         self._store.log_event(

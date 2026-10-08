@@ -2,23 +2,10 @@
 
 from __future__ import annotations
 
-from approve_exact.adapters.base import Adapter, ProviderRecord
-from approve_exact.effect import Effect, effect_hash
+from approve_exact.adapters.base import Adapter, record_matches
+from approve_exact.effect import effect_hash
 from approve_exact.executor import Outcome, _outcome
 from approve_exact.store import CorruptEffectError, Store
-
-
-def record_matches(effect: Effect, digest: str, record: ProviderRecord) -> bool:
-    """True when the provider record matches the effect field by field."""
-    return (
-        record.idempotency_key == effect.idempotency_key
-        and record.effect_hash == digest
-        and record.amount_paise == effect.amount_paise
-        and record.currency == effect.currency
-        and record.customer_email == effect.customer_email
-        and record.customer_name == effect.customer_name
-        and record.description == effect.description
-    )
 
 
 class FollowUp:
@@ -54,13 +41,30 @@ class FollowUp:
             return _outcome(False, "not in executed status", effect_id, row.status)
 
         digest = effect_hash(row.effect)
-        record = self._adapter.find(row.effect.idempotency_key)
+        try:
+            record = self._adapter.find(row.effect.idempotency_key)
+        except Exception as exc:
+            self._store.log_event(
+                effect_id,
+                "executed",
+                "executed",
+                f"verify find failed: {type(exc).__name__}",
+            )
+            raise
         if record is None:
-            if self._store.transition(
-                effect_id, "executed", "mismatch", "verify: provider record missing"
-            ):
-                return _outcome(False, "provider record missing", effect_id, "mismatch")
-            return _outcome(False, "could not mark mismatch", effect_id, row.status)
+            self._store.log_event(
+                effect_id, "executed", "executed", "verify: provider record missing"
+            )
+            return _outcome(False, "provider record missing", effect_id, "executed")
+
+        if row.provider_id and row.provider_id != record.provider_id:
+            reason = (
+                f"verify: stored provider_id {row.provider_id!r} "
+                f"differs from record {record.provider_id!r}"
+            )
+            if self._store.transition(effect_id, "executed", "mismatch", reason):
+                return _outcome(False, reason, effect_id, "mismatch")
+            return _outcome(False, "could not mark mismatch", effect_id, "executed")
 
         if not record_matches(row.effect, digest, record):
             if self._store.transition(
@@ -76,7 +80,7 @@ class FollowUp:
                     effect_id,
                     "mismatch",
                 )
-            return _outcome(False, "could not mark mismatch", effect_id, row.status)
+            return _outcome(False, "could not mark mismatch", effect_id, "executed")
 
         if not self._store.transition(
             effect_id,
@@ -113,7 +117,16 @@ class FollowUp:
             )
             return _outcome(False, "not in unknown status", effect_id, row.status)
 
-        record = self._adapter.find(row.effect.idempotency_key)
+        try:
+            record = self._adapter.find(row.effect.idempotency_key)
+        except Exception as exc:
+            self._store.log_event(
+                effect_id,
+                "unknown",
+                "unknown",
+                f"reconcile find failed: {type(exc).__name__}",
+            )
+            raise
         if record is None:
             self._store.log_event(
                 effect_id, "unknown", "unknown", "reconcile: provider record not found"
@@ -127,12 +140,6 @@ class FollowUp:
                 return _outcome(False, "empty provider_id", effect_id, "mismatch")
             return _outcome(False, "could not mark mismatch", effect_id, "unknown")
 
-        if not self._store.transition(
-            effect_id,
-            "unknown",
-            "executed",
-            "reconcile: provider record found",
-            provider_id=record.provider_id,
-        ):
+        if not self._store.mark_reconciled(effect_id, record.provider_id):
             return _outcome(False, "could not mark executed", effect_id, "unknown")
         return self.verify(effect_id)

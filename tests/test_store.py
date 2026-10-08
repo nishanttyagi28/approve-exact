@@ -50,11 +50,18 @@ def test_propose_and_approve_helper(tmp_path: Path) -> None:
 def test_transition_rejects_reserved_edges(tmp_path: Path) -> None:
     store = Store(tmp_path / "t.db")
     effect_id = store.propose(_effect())
-    with pytest.raises(ValueError, match="approve/claim helper"):
+    with pytest.raises(ValueError, match="dedicated helper"):
         store.transition(effect_id, "proposed", "approved", "no")
     assert store.approve(effect_id, _approval_for(store, effect_id))
-    with pytest.raises(ValueError, match="approve/claim helper"):
+    with pytest.raises(ValueError, match="dedicated helper"):
         store.transition(effect_id, "approved", "executing", "no")
+    assert store.claim_for_execute(effect_id)
+    assert store.transition(effect_id, "executing", "unknown", "timeout")
+    with pytest.raises(ValueError, match="dedicated helper"):
+        store.transition(effect_id, "unknown", "executed", "no")
+    assert store.mark_reconciled(effect_id, "prov-1") is True
+    row = store.get_effect(effect_id)
+    assert row is not None and row.status == "executed" and row.provider_id == "prov-1"
     store.close()
 
 

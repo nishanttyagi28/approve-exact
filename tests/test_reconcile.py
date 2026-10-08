@@ -5,7 +5,14 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
-from test_executor import SECRET, T0, approve, has_event, make_effect, make_env
+from test_executor import (
+    SECRET,
+    T0,
+    approve,
+    has_event,
+    make_effect,
+    make_env,
+)
 
 from approve_exact.adapters.base import ProviderTimeout
 from approve_exact.adapters.fake import FakeAdapter
@@ -34,6 +41,7 @@ def test_happy_path_verify(tmp_path: Path) -> None:
     row = store.get_effect(eid)
     assert out.ok and out.status == "verified" and adapter.creates == 1
     assert row is not None and row.status == "verified"
+    assert has_event(store, eid, "verify: provider record matches")
     store.close()
 
 
@@ -49,6 +57,8 @@ def test_timeout_reconcile_one_create(tmp_path: Path) -> None:
     row = store.get_effect(eid)
     assert recon.ok and recon.status == "verified" and adapter.creates == 1
     assert row is not None and row.status == "verified" and row.provider_id == "fake_1"
+    assert has_event(store, eid, "reconcile: provider record found")
+    assert has_event(store, eid, "verify: provider record matches")
     store.close()
 
 
@@ -140,4 +150,5 @@ def test_create_drift_mismatch(tmp_path: Path) -> None:
     row = store.get_effect(eid)
     assert out.status == "mismatch" and adapter.creates == 1
     assert row is not None and row.status == "mismatch"
+    assert has_event(store, eid, "provider record does not match effect")
     store.close()
